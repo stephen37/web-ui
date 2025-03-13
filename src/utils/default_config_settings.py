@@ -12,8 +12,8 @@ def default_config():
         "max_actions_per_step": 10,
         "use_vision": True,
         "tool_calling_method": "auto",
-        "llm_provider": "openai",
-        "llm_model_name": "gpt-4o",
+        "llm_provider": "google",
+        "llm_model_name": "gemini-2.0-flash-exp",
         "llm_temperature": 1.0,
         "llm_base_url": "",
         "llm_api_key": "",
@@ -27,7 +27,13 @@ def default_config():
         "save_recording_path": "./tmp/record_videos",
         "save_trace_path": "./tmp/traces",
         "save_agent_history_path": "./tmp/agent_history",
-        "task": "go to google.com and type 'OpenAI' click search and give me the first url",
+        "task": 
+        """Go to https://x.com/search?q=Milvus%20&src=recent_search_click and find the Tweets that talk about Milvus. 
+I only want to have tweets that talk about the Vector Database Milvus. 
+
+DO  NOT INCLUDE TWEETS ABOUT BIRDS, PHOTOGRAPHY, CAMERA, CANON.
+Please return tweets in a JSON Format, we have to include tweet text, the tweet url and the tweet author.
+        """,
     }
 
 

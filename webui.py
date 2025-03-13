@@ -1,40 +1,47 @@
-import pdb
 import logging
-
+import pdb
 from dotenv import load_dotenv
 
 load_dotenv()
-import os
-import glob
-import asyncio
 import argparse
+import asyncio
+import glob
 import os
+import json
 
 logger = logging.getLogger(__name__)
 
 import gradio as gr
-
 from browser_use.agent.service import Agent
-from playwright.async_api import async_playwright
 from browser_use.browser.browser import Browser, BrowserConfig
 from browser_use.browser.context import (
     BrowserContextConfig,
     BrowserContextWindowSize,
 )
+from gradio.themes import Base, Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft
 from langchain_ollama import ChatOllama
 from playwright.async_api import async_playwright
-from src.utils.agent_state import AgentState
+from pydantic import BaseModel
+from typing import List, Dict, Any
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.schema import AIMessage
 
-from src.utils import utils
 from src.agent.custom_agent import CustomAgent
+from src.agent.custom_prompts import CustomAgentMessagePrompt, CustomSystemPrompt
 from src.browser.custom_browser import CustomBrowser
-from src.agent.custom_prompts import CustomSystemPrompt, CustomAgentMessagePrompt
 from src.browser.custom_context import BrowserContextConfig, CustomBrowserContext
 from src.controller.custom_controller import CustomController
-from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
-from src.utils.default_config_settings import default_config, load_config_from_file, save_config_to_file, save_current_config, update_ui_from_config
-from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot
-
+from src.utils import utils
+from src.utils.agent_state import AgentState
+from src.utils.milvus_storage import storage
+from src.utils.default_config_settings import (
+    default_config,
+    load_config_from_file,
+    save_config_to_file,
+    save_current_config,
+    update_ui_from_config,
+)
+from src.utils.utils import capture_screenshot, get_latest_files, update_model_dropdown
 
 # Global variables for persistence
 _global_browser = None
@@ -42,6 +49,99 @@ _global_browser_context = None
 
 # Create the global agent state instance
 _global_agent_state = AgentState()
+
+class NewsItem(BaseModel):
+    date: str
+    title: str
+    link: str
+
+class NewsOutput(BaseModel):
+    latest_news: List[NewsItem]
+
+def save_agent_result_to_milvus(final_result, url=""):
+    """Store agent results in Milvus with appropriate metadata."""
+    try:
+        # Try to parse the result if it's a string
+        if isinstance(final_result, str):
+            try:
+                content = json.loads(final_result)
+            except json.JSONDecodeError:
+                content = final_result
+        else:
+            content = final_result
+
+        # Store with metadata
+        metadata = {
+            "source": "agent_result",
+            "timestamp": utils.get_current_timestamp()
+        }
+        
+        return storage.store(
+            content=content,
+            url=url,
+            content_type="agent_result",
+            metadata=metadata
+        )
+    except Exception as e:
+        return f"Error saving to Milvus: {str(e)}"
+
+def get_milvus_response(query, llm_provider=None, llm_model_name=None, llm_temperature=None, llm_base_url=None, llm_api_key=None):
+    """Get a response using RAG with Milvus."""
+    # Get relevant context from Milvus
+    results = storage.search(query, limit=3)
+    if not results:
+        return "I don't have any relevant information to answer your question."
+    
+    # Format context from results
+    context_parts = []
+    for r in results:
+        content = r['content']
+        if isinstance(content, dict):
+            # Format dictionary content nicely
+            content = json.dumps(content, indent=2)
+        context_parts.append(f"Content: {content}\nSource: {r['url']}\nType: {r['type']}")
+    
+    context = "\n\n".join(context_parts)
+    
+    # Get LLM using provided configuration or fallback to env vars
+    llm = utils.get_llm_model(
+        provider=llm_provider or os.getenv("LLM_PROVIDER", "openai"),
+        model_name=llm_model_name or os.getenv("LLM_MODEL_NAME", "gpt-3.5-turbo"),
+        temperature=llm_temperature or float(os.getenv("LLM_TEMPERATURE", "0.7")),
+        api_key=llm_api_key or os.getenv("LLM_API_KEY"),
+        base_url=llm_base_url or os.getenv("LLM_BASE_URL"),
+    )
+
+    # Construct prompt with context
+    prompt = f"""Based on the following context, please answer the question. If the context doesn't contain relevant information, say so.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+
+    # Get response from LLM
+    try:
+        if isinstance(llm, ChatGoogleGenerativeAI):
+            llm_response = llm.invoke(prompt).content
+        else:
+            response = llm.invoke(prompt)
+            if isinstance(response, AIMessage):
+                llm_response = response.content
+            else:
+                llm_response = str(response)
+        
+        # Add source information
+        source_info = "\n\nSources:"
+        for r in results:
+            source_info += f"\n- {r['url']} (Relevance: {r['score']}, Type: {r['type']})"
+        
+        return str(llm_response) + str(source_info)
+    except Exception as e:
+        logger.error(f"Error getting LLM response: {e}")
+        return f"Error: Could not generate response. Please try again. ({str(e)})"
 
 async def stop_agent():
     """Request the agent to stop and update UI with enhanced feedback"""
@@ -197,9 +297,18 @@ async def run_browser_agent(
             if new_videos - existing_videos:
                 latest_video = list(new_videos - existing_videos)[0]  # Get the first new video
 
+        # Save the final result to Milvus if it exists
+        milvus_save_result = ""
+        if final_result:
+            milvus_save_result = save_agent_result_to_milvus(final_result)
+            logger.info(f"Milvus save result: {milvus_save_result}")
+
+        # Convert errors to string if it's a list
+        errors_str = "\n".join(errors) if isinstance(errors, list) else str(errors)
+        
         return (
             final_result,
-            errors,
+            errors_str + "\n" + milvus_save_result if milvus_save_result else errors_str,  # Add Milvus result to errors
             model_actions,
             model_thoughts,
             latest_video,
@@ -1006,6 +1115,34 @@ def create_ui(config, theme_name="Ocean"):
                     outputs=[config_status]
                 )
 
+            with gr.Tab("RAG Search"):
+                with gr.Row():
+                    query_input = gr.Textbox(
+                        label="Search Query",
+                        placeholder="Search for Python news...",
+                        lines=3
+                    )
+                    search_button = gr.Button("Search")
+                
+                with gr.Row():
+                    results_output = gr.Textbox(
+                        label="Search Results",
+                        lines=10,
+                        max_lines=20
+                    )
+                
+                search_button.click(
+                    fn=get_milvus_response,
+                    inputs=[
+                        query_input,
+                        llm_provider,
+                        llm_model_name,
+                        llm_temperature,
+                        llm_base_url,
+                        llm_api_key
+                    ],
+                    outputs=[results_output]
+                )
 
         # Attach the callback to the LLM provider dropdown
         llm_provider.change(
