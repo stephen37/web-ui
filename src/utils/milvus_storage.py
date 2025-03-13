@@ -12,8 +12,9 @@ class MilvusStorage:
         self.client = MilvusClient(uri=uri)
         self.collection_name = collection_name
         self.encoder = SentenceTransformer('all-MiniLM-L6-v2')
-        self.client.load_collection(self.collection_name)
         # self._recreate_collection()
+        self.client.load_collection(self.collection_name)
+        
 
     def _recreate_collection(self):
         """Drop existing collection and create a new one with the current schema."""
